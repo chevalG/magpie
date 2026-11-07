@@ -157,8 +157,10 @@ func (t codexSocket) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	if k := codexKeepTake(key); k != nil {
 		send := msg
+		delta := false
 		if d, ok := k.delta(body, shape); ok {
 			send = codexCreate(d)
+			delta = true
 		}
 		if codexMessageTooBig(req.URL.Host, len(send)) {
 			k.close()
@@ -166,6 +168,26 @@ func (t codexSocket) RoundTrip(req *http.Request) (*http.Response, error) {
 			res, err := t.turn(req, k, send, shape, true)
 			if !errors.Is(err, errCodexSocketAgain) {
 				return res, err
+			}
+			// the kept socket failed before the reply was handed on. When
+			// the turn went as a delta, the backend may still hold the
+			// reply it named after the socket is gone (a fresh dial whose
+			// first message names it with previous_response_id is
+			// answered: four of four attempts against chatgpt.com, a
+			// conversation whose socket was closed mid-way), so the same
+			// delta rides a fresh socket once, and that socket is kept
+			// for the turns after. A backend that refuses the delta (the
+			// response's own error) says so, and the turn goes whole on
+			// a new socket, and from there over HTTP, as a turn with no
+			// kept socket does.
+			if delta {
+				res, err := t.socket(req, send, key, shape)
+				if err == nil && res.StatusCode == http.StatusOK {
+					return res, nil
+				}
+				if res != nil {
+					res.Body.Close()
+				}
 			}
 		}
 	}

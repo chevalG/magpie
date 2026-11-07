@@ -115,8 +115,9 @@ func TestCodexKeptSocketSendsTheDelta(t *testing.T) {
 	}
 }
 
-// A backend that lost the response (previous_response_not_found) is
-// asked again whole, on a new socket, and the turn ends as it should.
+// A backend that lost the response (previous_response_not_found) has the
+// delta's resurrect tried once on a fresh dial, refused again, and then
+// the turn is asked again whole, on a new socket, ending as it should.
 func TestCodexKeptSocketLostResponseGoesWhole(t *testing.T) {
 	socketOn(t)
 	f := &fakeSocketBackend{keep: true}
@@ -131,19 +132,22 @@ func TestCodexKeptSocketLostResponseGoesWhole(t *testing.T) {
 
 	keptPost(t, "acct-1", keptTurn("conv-1", "gpt-5.5", userPing))
 	keptPost(t, "acct-1", keptTurn("conv-1", "gpt-5.5", userPing, asstPong, userAgain))
-	if posts, sockets := f.counts(); posts != 0 || sockets != 3 || f.opened() != 2 {
-		t.Fatalf("%d posts, %d turns on %d sockets; want the refused delta again whole on a second socket", posts, sockets, f.opened())
+	// the refused delta was resurrected once (the third socket, the same
+	// delta), refused again, and the turn asked again whole on a fourth
+	if posts, sockets := f.counts(); posts != 0 || sockets != 4 || f.opened() != 3 {
+		t.Fatalf("%d posts, %d turns on %d sockets; want the refused delta resurrected once, then whole", posts, sockets, f.opened())
 	}
-	last := f.turn(2)
-	if last.socket != 2 || gjson.GetBytes(last.msg, "previous_response_id").Exists() ||
+	last := f.turn(3)
+	if last.socket != 3 || gjson.GetBytes(last.msg, "previous_response_id").Exists() ||
 		len(gjson.GetBytes(last.msg, "input").Array()) != 3 {
 		t.Errorf("retry on socket %d: %s", last.socket, last.msg)
 	}
 }
 
 // A kept socket the backend closed meanwhile is found closed on the next
-// turn, which goes whole on a new socket.
-func TestCodexKeptSocketClosedMeanwhileGoesWhole(t *testing.T) {
+// turn: the turn's delta rides a fresh dial, naming the reply the
+// upstream still holds, and the fresh socket is kept for the turns after.
+func TestCodexKeptSocketClosedMeanwhileResumed(t *testing.T) {
 	socketOn(t)
 	f := &fakeSocketBackend{} // closes after each turn
 	f.frames = keptReply(f)
@@ -154,8 +158,24 @@ func TestCodexKeptSocketClosedMeanwhileGoesWhole(t *testing.T) {
 	if posts, sockets := f.counts(); posts != 0 || sockets != 2 || f.opened() != 2 {
 		t.Fatalf("%d posts, %d turns on %d sockets", posts, sockets, f.opened())
 	}
-	if m := f.turn(1).msg; gjson.GetBytes(m, "previous_response_id").Exists() {
-		t.Errorf("a new socket was sent the delta: %s", m)
+	m := f.turn(1)
+	if got := gjson.GetBytes(m.msg, "previous_response_id").String(); got != "resp-1" {
+		t.Errorf("previous_response_id %q, want resp-1: %s", got, m.msg)
+	}
+	in := gjson.GetBytes(m.msg, "input").Array()
+	if len(in) != 1 || in[0].Get("content.0.text").String() != "again" {
+		t.Errorf("resumed delta input %s, want only the new user message", m.msg)
+	}
+	// a third turn rides a fresh dial as a delta too: this fake closes its
+	// socket after every turn, and the resurrection covers each one (a
+	// backend that keeps the socket would see the resumed one reused)
+	keptPost(t, "acct-1", keptTurn("conv-1", "gpt-5.5", userPing, asstPong, userAgain, asstPong, userAgain))
+	if _, sockets := f.counts(); sockets != 3 || f.opened() != 3 {
+		t.Fatalf("%d turns on %d sockets; want each turn's delta on its own fresh dial", sockets, f.opened())
+	}
+	m3 := f.turn(2)
+	if got := gjson.GetBytes(m3.msg, "previous_response_id").String(); got != "resp-2" {
+		t.Errorf("turn 3 names %q, want resp-2: %s", got, m3.msg)
 	}
 }
 
